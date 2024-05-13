@@ -1,6 +1,7 @@
 import json
 import Microphone as mc
 from scipy.signal import fftconvolve
+import scipy.signal as sg
 import scipy.special as sp
 from scipy.special import spherical_jn, sph_harm
 import numpy as np
@@ -15,101 +16,26 @@ import pickle
 from scipy.optimize import basinhopping, brute, differential_evolution
 import matplotlib
 from datetime import datetime
-import calibration as clb
 import glob
 import os
 import ambixutil as amb
 from scipy.io.wavfile import write
 from scipy.io import wavfile
+import convertangle as ca
 
 matplotlib.rc('xtick', labelsize=18)
 matplotlib.rc('ytick', labelsize=18)
 
-""" date: 22 haziran 22
-    author: ege
-    name: multi_r16.py : mds transformation deniyorum, load pickle ile md.py çıktılarını kullanarak
-    
-    27.09.22 fonksiyonları silip ortak dosyadan çağırma
-    
-    26 Nisan 24
-    corrected the numpy depreciation warning
-    """
-
-def cart2sphr(xyz):  # Ege'
-    """ converting a multiple row vector matrix from cartesian to spherical coordinates """
-    c = np.zeros((xyz.shape[0], 2))
-    r = []
-    tt = []
-    for i in range(xyz.shape[0]):
-        x = xyz[i][0]
-        y = xyz[i][1]
-        z = xyz[i][2]
-
-        rad = np.sqrt(x * x + y * y + z * z)
-        tt.append(rad)
-        theta = np.arccos(z / rad)
-        phi = np.arctan2(y, x)
-        c[i][0] = theta
-        c[i][1] = phi
-        r.append(rad)
-
-    return [c, np.array(r)]
-
-def cart2sph_single(xyz):  # (ege)
-    """ converting a single row vector from cartesian to spherical coordinates """
-    # takes list xyz (single coord)
-    x = xyz[0]
-    y = xyz[1]
-    z = xyz[2]
-
-    r = np.sqrt(x * x + y * y + z * z)
-    theta = np.arccos(z / r)
-    phi = np.arctan2(y, x)
-    return (r, theta, phi)
-
-def cart2sph(x, y, z):
-    """
-
-    :param x: x-plane coordinate
-    :param y: y-plane coordinate
-    :param z: z-plane coordinate
-    :return: Spherical coordinates (r, th, ph)
-    """
-    r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
-    th = np.arccos(z / r)
-    ph = np.arctan2(y, x)
-    return r, th, ph
-
-def cart2sphr_sparg(xyz):
-    """ converting a multiple row vector matrix from cartesian to spherical coordinates """
-    c = np.zeros((xyz.shape[0], 2))
-    r = []
-    tt = []
-    for i in range(xyz.shape[0]):
-        x = xyz[i][0]
-        y = xyz[i][1]
-        z = xyz[i][2]
-
-        rad = np.sqrt(x * x + y * y + z * z)
-        tt.append(rad)
-        theta = np.arccos(z / rad)
-        phi = np.arctan2(y, x)
-        c[i][0] = theta
-        c[i][1] = phi
-        r.append(rad)
-    return (np.array(r), c[:, 0], c[:, 1])
-
-def sph2cart(r, th, ph):
-    x = r * np.sin(th) * np.cos(ph)
-    y = r * np.sin(th) * np.sin(ph)
-    z = r * np.cos(th)
-    u = np.array([x, y, z])
-    return u
+""" notes: """
 
 def mic_sub(mic_p, mic_q):
     mic_pq = mic_p - mic_q
     return mic_pq
-
+def corralign(ch1, ch2):
+    crr = sg.correlate(ch1, ch2, mode="full", method="fft")
+    lags = sg.correlation_lags(ch1.size, ch2.size, mode="full")
+    lag = lags[np.argmax(crr)]
+    return lag
 def shd_add_noise(n, m):
     em32 = mc.EigenmikeEM32()
     estr = em32.returnAsStruct()
@@ -244,7 +170,8 @@ def L_multipole(ordd, a, k, mics):
                 rq_p = mics.get(row)
                 rp_p = mics.get(col)
                 rpq_p = mic_sub(rq_p, rp_p)
-                rpq_p_sph = cart2sph(rpq_p[0], rpq_p[1], rpq_p[2])
+                # rpq_p_sph = cart2sph(rpq_p[0], rpq_p[1], rpq_p[2])
+                rpq_p_sph = ca.cart2sph_single(rpq_p)
                 L = L_dipole(ordd, a, k, rpq_p_sph)
             L_matrix[((row - 1) * sqr_size):((row) * sqr_size), ((col - 1) * sqr_size):((col) * sqr_size)] = L
     return L_matrix
@@ -279,11 +206,11 @@ def C_multipole(N, freq, s_sph, k, mics, flag, rot):
         q = keys[0]
         rq_p = q
         if flag == "same cin":
-            src_inward_sph = cart2sph(-src[0], -src[1], -src[2])  # r,th,phi
+            src_inward_sph = ca.cart2sph_single(-src)  # r,th,phi
             src_inward_cart = -src
         elif flag == "pw calibrated cin":
             mic_src = (q - src)
-            src_inward_sph = cart2sph(mic_src[0], mic_src[1], mic_src[2])
+            src_inward_sph = ca.cart2sph_single(mic_src)
             src_inward_cart = mic_src
         else:
             print("no such flag exists")
@@ -321,7 +248,7 @@ def pressure_withA(n_low, a, k, Anm):
     :param a: Radius of sphere
     :param k: wave number
     :param Anm: Spherical Harmonics Coefficient (Matrix form)
-    :return: Pressure for each microphones
+    :return: Pressure for each microphone
     """
     rho = 1.225  # Density of air
     c = 343  # Speed of sound
@@ -453,7 +380,7 @@ def C_tilde_to_Anm(C, f, rho, mics):
 
 def pfield_sphsparg(f, k, mesh_row, N, C_in):
     """ extrapolated pressure at distance r with given anm's [as a list]"""
-    mesh_sph, r = cart2sphr(mesh_row)
+    mesh_sph, r = ca.cart2sphr(mesh_row)
     th = mesh_sph[:, 0]
     ph = mesh_sph[:, 1]
     rho = 1.225
@@ -474,7 +401,7 @@ def pfield_sphsparg(f, k, mesh_row, N, C_in):
 def pfield_sphsparg_point(f, k, mesh_row, N, C_in):
     """ extrapolated pressure at distance r with given anm's [as a list]"""
 
-    r, th, ph = cart2sph_single(mesh_row)
+    r, th, ph = ca.cart2sph_single(mesh_row)
     rho = 1.225
     pr = 0
     kr = k * r
@@ -770,7 +697,7 @@ def cin_scaling(mics, src, N):
         mic_src = mic - src
         mic_src_list.append(-mic_src)
 
-    mic_src_sph = cart2sphr_sparg(np.array(mic_src_list))
+    mic_src_sph = ca.cart2sphr_sparg(np.array(mic_src_list))
     ynmz = []
     for n in range(N + 1):
         for m in range(-n, n + 1):
@@ -1200,9 +1127,7 @@ def list2dict(ls):
 
 if __name__ == '__main__':
 
-    # FLAG = "ege_windows"
     FLAG = "ege_mac"
-    start_time = datetime.now()
 
     """ Ambixutil: wav-ambix-shd conversion """
 
@@ -1251,12 +1176,12 @@ if __name__ == '__main__':
     mics = mic_dict_z
 
     src = mic_list_z[7]
-    rsrc_sph = cart2sph(src[0], src[1], src[2])  # source coordinates in spherical coors.
+    rsrc_sph = ca.cart2sph_single(src)  # source coordinates in spherical coors.
     """
 
     mic_dict_z = list2dict(rotated_mic_list_z[0:7, :])
     src = rotated_mic_list_z[7]
-    rsrc_sph = cart2sph(src[0], src[1], src[2])  # source coordinates in spherical coors.
+    rsrc_sph = ca.cart2sph_single(src)  # source coordinates in spherical coors.
 
     mics_all = {1: mic_list_z[0], 2: mic_list_z[1], 3: mic_list_z[2], 4: mic_list_z[3], 5: mic_list_z[4], 6: mic_list_z[5],
             7: mic_list_z[6]}
@@ -1264,7 +1189,7 @@ if __name__ == '__main__':
 
     # experiment with less no. of mics
     # mics = {k: v for k, v in mics.items() if k in [1, 2]}
-    plot_scene(src, mics)
+    # plot_scene(src, mics)
 
     rate, _, rawlist_orj, ambix_list = wav2shd_nmax(subdir, filterdir, nmax=n)  # for different n's
     # rate, shd_list, wav_list = wav2shd_nmax_pre(subd, filterdir, n, mics, src, fs)  # for different n's, geo delay prealigned
@@ -1272,7 +1197,7 @@ if __name__ == '__main__':
     # Calculate delay via crosscorrelation of the 0th order SH channels
     delay_list = np.zeros(len(mics))
     for i in range(len(mics)-1):
-        delay_list[i+1] = int(clb.corralign(ambix_list[0][0, :], ambix_list[i+1][0, :]))
+        delay_list[i+1] = int(corralign(ambix_list[0][0, :], ambix_list[i+1][0, :]))
 
     rawlist_arr = np.array(rawlist_orj)
     samplelist_neworg = np.array(delay_list) - np.min(delay_list)
@@ -1305,9 +1230,6 @@ if __name__ == '__main__':
     for i in range(len(mics)):
         plt.plot(toa_aligned_multi_arr[i,:,4])
     plt.show()
-    end_time = datetime.now()
-
-    print('Part 1: Crosscorrelation Duration'.format(end_time - start_time))
 
     " ROTATION OPTIMISATION "
 
@@ -1354,14 +1276,6 @@ if __name__ == '__main__':
     #del_err = dict()
     #del_error_list = []
 
-    start_time = datetime.now()
-    Larr = []
-    for ind in range(len(fr)):
-        k = 2 * pi * fr[ind] / c
-        Larr.append(L_multipole(n, a, k, mics))
-    end_time = datetime.now()
-    print('Part 2: L Matrix Duration: {}'.format(end_time - start_time))
-
     # stack mic shd's 
     #flag = "toa off"
     #flag = "toa on"
@@ -1375,18 +1289,6 @@ if __name__ == '__main__':
     # dtot = np.hstack((d1,d2,d3,d4,d5,d6,d7))
     # anm_time_aligned = np.transpose(dtot)
 
-    """ SINGLE FREQ ROTATION OPTIMISATION  
-    f_ind = 15
-    f = fr[f_ind]
-    rot list = number of mics = np.zeros((len(mics))
-    res = minimize(total_cin_err_real, np.zeros((len(mics))), (anm_time_aligned, Larr, n, mics, f, f_ind, a), method='Nelder-Mead')
-    print("minimum with only nelder-mead:", np.degrees(res.x))
-    minimizer_kwargs = {"method": "Nelder-Mead", "args": (anm_time_aligned, Larr, n, mics, f, f_ind, a), "bounds": bnds, "jac": False}
-    ret = basinhopping(total_cin_err_real, np.zeros(len(mics)), minimizer_kwargs=minimizer_kwargs, niter=50)
-    print("global minimum with basinhopping: x = ", np.degrees(ret.x), "\nf(x) = %.4f" % (ret.fun))
-    
-    """
-
     flag_opt = "basinhopping" # basinhopping, differential_evolution, brute
 
     """ MULTIPLE FREQ ROTATION OPTIMISATION """
@@ -1394,24 +1296,15 @@ if __name__ == '__main__':
     rot_bnd = np.pi / 3
     no_of_mics_for_opt = 2
     sqr_size = (n + 1) ** 2
-    #
-    # comb = [(1, 5)]
-    # no_of_mics_for_opt = len(comb[0])
-    #
-    # comb = combinations(range(1, len(mics) + 1), no_of_mics_for_opt)
-    # L_matrix = np.eye(sqr_size * no_of_mics_for_opt, dtype=complex)
-    #
-    # for i, j in list(comb):
-    #     if i == j:
-    #         L = np.eye(sqr_size)
-    #     else:
-    #         lower = Larr[((i - 1) * sqr_size):((i) * sqr_size), ((j - 1) * sqr_size):((j) * sqr_size)]
-    #         upper = Larr[((j - 1) * sqr_size):((j) * sqr_size), ((i - 1) * sqr_size):((i) * sqr_size)]
-    #
-    #     L_matrix[1*sqr_size : 2*sqr_size, 0*sqr_size : 1*sqr_size] = lower
-    #     L_matrix[0 * sqr_size: 1 * sqr_size, 1 * sqr_size: 2 * sqr_size] = upper
 
-    # anm_time_aligned_pairs = anm_time_aligned[ ((i - 1) * sqr_size):((j - 1) * sqr_size),:]
+    start_time = datetime.now()
+    Larr = []
+    for ind in range(len(fr)):
+        k = 2 * pi * fr[ind] / c
+        Larr.append(L_multipole(n, a, k, mics))
+    end_time = datetime.now()
+    print('Part 2: L Matrix Duration: {}'.format(end_time - start_time))
+
 
     bnds = tuple([(-rot_bnd, rot_bnd)] * (no_of_mics_for_opt))
 
@@ -1436,9 +1329,17 @@ if __name__ == '__main__':
     end_time = datetime.now()
     print('Part 3: Optimisation Duration: {}'.format(end_time - start_time))
 
+    """ SINGLE FREQ ROTATION OPTIMISATION  
+        f_ind = 15
+        f = fr[f_ind]
+        rot list = number of mics = np.zeros((len(mics))
+        res = minimize(total_cin_err_real, np.zeros((len(mics))), (anm_time_aligned, Larr, n, mics, f, f_ind, a), method='Nelder-Mead')
+        print("minimum with only nelder-mead:", np.degrees(res.x))
+        minimizer_kwargs = {"method": "Nelder-Mead", "args": (anm_time_aligned, Larr, n, mics, f, f_ind, a), "bounds": bnds, "jac": False}
+        ret = basinhopping(total_cin_err_real, np.zeros(len(mics)), minimizer_kwargs=minimizer_kwargs, niter=50)
+        print("global minimum with basinhopping: x = ", np.degrees(ret.x), "\nf(x) = %.4f" % (ret.fun))
 
-
-
+        """
 
 
 
