@@ -149,7 +149,7 @@ def get_key(poles, val):
             k = key
             return k
 
-def L_multipole(ordd, a, k, mics):
+def L_multipole_v1(ordd, a, k, mics):
     """
     :param deg: Spherical harmonic order
     :param a: radius of sphere = 0.042
@@ -159,21 +159,48 @@ def L_multipole(ordd, a, k, mics):
     """
     sqr_size = (ordd + 1) ** 2  # (Lmax - 1) ** 2
     key, mic_locs = zip(*mics.items())
-    Lsize = max(key)
+    # Lsize = max(key)
+    Lsize = len(key)
     L_matrix = np.eye(sqr_size * Lsize, dtype=complex)
 
-    for row in key:
-        for col in key:
+    for row in range(Lsize):
+        for col in range(Lsize):
             if row == col:
                 L = np.eye(sqr_size)
             else:
                 rq_p = mics.get(row)
                 rp_p = mics.get(col)
                 rpq_p = mic_sub(rq_p, rp_p)
-                # rpq_p_sph = cart2sph(rpq_p[0], rpq_p[1], rpq_p[2])
                 rpq_p_sph = ca.cart2sph_single(rpq_p)
                 L = L_dipole(ordd, a, k, rpq_p_sph)
             L_matrix[((row - 1) * sqr_size):((row) * sqr_size), ((col - 1) * sqr_size):((col) * sqr_size)] = L
+    return L_matrix
+
+def L_multipole(ordd, a, k, mics):
+    """
+    :param deg: Spherical harmonic order
+    :param a: radius of sphere = 0.042
+    :param k: wave number
+    :param poles: Coordinates of multipoles = mic locations
+    :return: Reexpansion coefficient (SR) multipoles
+    """
+    sqr_size = (ordd + 1) ** 2  # (Lmax - 1) ** 2
+    key, mic_locs = zip(*mics.items())
+    # Lsize = max(key)
+    Lsize = len(key)
+    L_matrix = np.eye(sqr_size * Lsize, dtype=complex)
+
+    for row in range(Lsize):
+        for col in range(Lsize):
+            if row == col:
+                L = np.eye(sqr_size)
+            else:
+                rq_p = mics.get(key[row])
+                rp_p = mics.get(key[col])
+                rpq_p = mic_sub(rq_p, rp_p)
+                rpq_p_sph = ca.cart2sph_single(rpq_p)
+                L = L_dipole(ordd, a, k, rpq_p_sph)
+            L_matrix[((row) * sqr_size):((row+1) * sqr_size), ((col) * sqr_size):((col+1) * sqr_size)] = L
     return L_matrix
 
 def D_multipole(C, mics, n, k, a):
@@ -1125,6 +1152,68 @@ def list2dict(ls):
         mic_dict_z[i + 1] = ls[i]
     return mic_dict_z
 
+def optimise_pair_orientation(mics, anm_time_aligned, fr, a, rot_bnd, flag_opt="basinhopping"):
+    print(f" pair optimisation with {flag_opt}:")
+    no_of_mics_for_opt = 2
+    comb = combinations(range(1, len(mics) + 1), no_of_mics_for_opt)
+    results = []
+    for i, j in list(comb):
+        if i == 1:
+            print(i, j)
+            mic_pairs = {k: v for k, v in mics.items() if k in [i, j]}
+
+            Larr = []
+            anm_pairs = []
+            for ind in range(len(fr)):
+                k = 2 * pi * fr[ind] / c
+                Larr.append(L_multipole(n, a, k, mic_pairs))
+
+                anm = anm_time_aligned[:, ind]
+                slice = np.concatenate(
+                    [anm[((i - 1) * sqr_size):(i * sqr_size)], anm[((j - 1) * sqr_size):(j * sqr_size)]])
+                anm_pairs.append(slice)
+
+            anm_pairs = np.array(anm_pairs).T
+            bnds = tuple([(-rot_bnd, rot_bnd)] * (no_of_mics_for_opt))
+            params = (anm_pairs, Larr, n, mic_pairs, fr, a)
+
+            if flag_opt == "basinhopping":
+                minimizer_kwargs = {"method": "Nelder-Mead", "args": params, "bounds": bnds, "jac": False}
+                ret = basinhopping(total_cin_roterr_fiter_real, np.zeros(len(mic_pairs)),
+                                   minimizer_kwargs=minimizer_kwargs, niter=50)
+                results.append(np.degrees(ret.x))
+                # print("global minimum with basinhopping: x = ", np.degrees(ret.x), "\nf(x) = %.4f" % (ret.fun))
+
+            elif flag_opt == "differential_evolution":
+                res = differential_evolution(total_cin_roterr_fiter_real, bnds, args=params)
+                results.append(np.degrees(res.x))
+                # print("global minimum with differential_evolution: x = ", np.degrees(res.x), "\nsuccess:",
+                #       res.success, "\nres.fun:", res.fun)
+
+            elif flag_opt == "brute":
+                x, f, y, z = brute(total_cin_roterr_fiter_real, bnds, args=params, full_output=True)
+                results.append(x)
+                # print("minimum with brute force: x = ", x)
+
+            # end_time = datetime.now()
+            # print('Part 3: Optimisation Duration: {}'.format(end_time - start_time))
+    return(results)
+
+def normalise_misorientations(result):
+
+    res = np.array(result)
+
+    # Calculate the rotation differences between the microphone pairs
+    diff = res[:, 1] - res[:, 0]
+
+    # Use relative mic1 and mic2 orientation diff. results as a reference/base
+    mic1, mic2 = res[0]
+
+    # Create the final list by adding the differences to mic1 starting from the third mic
+    final_calibration = np.concatenate(([mic1, mic2], mic1 + diff[1:]))
+
+    return(final_calibration)
+
 if __name__ == '__main__':
 
     FLAG = "ege_mac"
@@ -1142,21 +1231,6 @@ if __name__ == '__main__':
     a = 5.5e-2  # Radius of the spheres  (42e-3 for eigenmic)
     c = 343  # Speed of sound
 
-    # MDS LOCAL CODE LOCATIONs
-
-    """   
-    m1 = np.array([0.24713039, - 0.12799929, 8.85000000e-01])  # 1
-    m2 = np.array([0.12284332, 0.06532657, 0.885])  # 2
-    m3 = np.array([0.14605493, - 0.3343197, 0.885])  # 3
-    m4 = np.array([0.01751808, - 0.13803243, 0.885])  # 4
-    m5 = np.array([0.35732658, 0.07359733, 0.885])  # 5
-    m6 = np.array([0.3769871, - 0.32379636, 0.885])  # 6
-    m7 = np.array([0.48197453, - 0.12108931, 0.885])  # 7
-    src_orh = np.array([-1.74983493, 0.90631319, 1.3])
-
-    mics_orh = {1: m1, 2: m2, 3: m3, 4: m4, 5: m5, 6: m6, 7: m7}
-    """
-
     # Load json-mic locations
     if FLAG == "ege_mac":
         mic_list_z, mic_dict_z = json2miclist_z("./data/smallhexalab.json")
@@ -1164,28 +1238,15 @@ if __name__ == '__main__':
         rotated_mic_list_z = pickle.load(file)
         file.close()
 
-    """
-    # z axis of seven mics set to mic height
-    mic_list_z[0:7, 2] = 0.885
-    # z axis of the source set to 1.3
-    mic_list_z[7, 2] = 1.3
-    # mic_list_z[7, 2] = 0.885
-
-    mic_dict_z = list2dict(mic_list_z[0:7, :])
-    # mic_dict_z = list2dict(mic_list_z[0:2, :])
-    mics = mic_dict_z
-
-    src = mic_list_z[7]
-    rsrc_sph = ca.cart2sph_single(src)  # source coordinates in spherical coors.
-    """
-
     mic_dict_z = list2dict(rotated_mic_list_z[0:7, :])
     src = rotated_mic_list_z[7]
     rsrc_sph = ca.cart2sph_single(src)  # source coordinates in spherical coors.
 
-    mics_all = {1: mic_list_z[0], 2: mic_list_z[1], 3: mic_list_z[2], 4: mic_list_z[3], 5: mic_list_z[4], 6: mic_list_z[5],
-            7: mic_list_z[6]}
-    mics = {1: mic_list_z[0], 2: mic_list_z[1]}
+    # mics = {1: mic_list_z[0], 2: mic_list_z[1], 3: mic_list_z[2], 4: mic_list_z[3], 5: mic_list_z[4], 6: mic_list_z[5],
+    #         7: mic_list_z[6]}
+
+    mics = {1: rotated_mic_list_z[0], 2: rotated_mic_list_z[1], 3: rotated_mic_list_z[2], 4: rotated_mic_list_z[3], 5: rotated_mic_list_z[4], 6: rotated_mic_list_z[5],
+            7: rotated_mic_list_z[6]}
 
     # experiment with less no. of mics
     # mics = {k: v for k, v in mics.items() if k in [1, 2]}
@@ -1276,13 +1337,8 @@ if __name__ == '__main__':
     #del_err = dict()
     #del_error_list = []
 
-    # stack mic shd's 
-    #flag = "toa off"
-    #flag = "toa on"
-    
     shd_list_toa, _ = wav2shd_fromarray(toa_aligned_multi_arr, nmax=n, nfft=16384)
     anm_time_aligned = stackshd(shd_list_toa, f_ind, n0=n)
-    #anm_time_aligned = anm_time_aligned[0:(len(mics)*((n+1)**2)),:]
 
     print("anm_time_aligned shape:", anm_time_aligned.shape)
     #print(anm_time_aligned)
@@ -1294,40 +1350,11 @@ if __name__ == '__main__':
     """ MULTIPLE FREQ ROTATION OPTIMISATION """
 
     rot_bnd = np.pi / 3
-    no_of_mics_for_opt = 2
     sqr_size = (n + 1) ** 2
 
-    start_time = datetime.now()
-    Larr = []
-    for ind in range(len(fr)):
-        k = 2 * pi * fr[ind] / c
-        Larr.append(L_multipole(n, a, k, mics))
-    end_time = datetime.now()
-    print('Part 2: L Matrix Duration: {}'.format(end_time - start_time))
-
-
-    bnds = tuple([(-rot_bnd, rot_bnd)] * (no_of_mics_for_opt))
-
-    start_time = datetime.now()
-    print("optimisation has started:")
-
-    # Set the optimisation function
-    params = (anm_time_aligned, Larr, n, mics, fr, a)
-    if flag_opt == "basinhopping":
-        minimizer_kwargs = {"method": "Nelder-Mead", "args": params, "bounds": bnds, "jac": False}
-        ret = basinhopping(total_cin_roterr_fiter_real, np.zeros(len(mics)), minimizer_kwargs=minimizer_kwargs, niter=50)
-        print("global minimum with basinhopping: x = ", np.degrees(ret.x), "\nf(x) = %.4f" % (ret.fun))
-
-    elif flag_opt == "differential_evolution" :
-        res = differential_evolution(total_cin_roterr_fiter_real, bnds, args=params)
-        print("global minimum with differential_evolution: x = ", np.degrees(res.x), "\nsuccess:", res.success, "\nres.fun:", res.fun)
-
-    elif flag_opt == "brute":
-        x, f, y, z = brute(total_cin_roterr_fiter_real, bnds, args=params, full_output=True)
-        print("minimum with brute force: x = ", x)
-
-    end_time = datetime.now()
-    print('Part 3: Optimisation Duration: {}'.format(end_time - start_time))
+    result = optimise_pair_orientation(mics, anm_time_aligned, fr, a, rot_bnd, flag_opt="basinhopping")
+    orientation_calibration = normalise_misorientations(result)
+    print(f"orientation calibration results: {orientation_calibration}")
 
     """ SINGLE FREQ ROTATION OPTIMISATION  
         f_ind = 15
